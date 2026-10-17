@@ -42,11 +42,18 @@ final class AnisetteDataHelper
     func getAnisetteData(refresh: Bool = false) async throws -> AnisetteData
     {
         
+        // Always use the server that is currently configured in Settings
+        self.url = AnisetteSettings.serverURL
+        
         if url == nil {
             throw "No Anisette Server Found!"
         }
         
         self.printOut("Anisette URL: \(self.url!.absoluteString)")
+        
+        // Decide which client info / user agent is presented to Apple and drop
+        // provisioning data that was created for a different server or identity.
+        await self.resolveIdentity()
         
         let ans : AnisetteData
         if let identifier = Keychain.shared.identifier,
@@ -336,21 +343,16 @@ final class AnisetteDataHelper
     // MARK: - V3: FETCHING
     
     func fetchClientInfo() async throws {
-        if  self.clientInfo != nil &&
-                self.userAgent != nil &&
-                self.mdLu != nil &&
+        if self.clientInfo == nil || self.userAgent == nil {
+            await self.resolveIdentity()
+        }
+        
+        if  self.mdLu != nil &&
                 self.deviceId != nil &&
                 Keychain.shared.identifier != nil {
             self.printOut("Skipping client_info fetch since all the properties we need aren't nil")
             return
         }
-        
-        self.printOut("Using custom client_info")
-                        
-        self.clientInfo = "<iMac18,3> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
-        self.userAgent = "AuthKit/1 (Macintosh; OS X 27.0) (com.apple.akd/1.0)"
-        self.printOut("Client-Info: \(self.clientInfo!)")
-        self.printOut("User-Agent: \(self.userAgent!)")
         
         if Keychain.shared.identifier == nil {
             self.printOut("Generating identifier")
@@ -435,6 +437,119 @@ final class AnisetteDataHelper
     }
     
     
+    // MARK: - Identity (client info + user agent)
+    
+    /// Forces one specific identity for the current sign-in (used for the -80045 fallback).
+    var identityOverride: AnisetteIdentity?
+    
+    /// Decides which X-MMe-Client-Info / User-Agent pair is presented to Apple.
+    ///
+    /// Since 2026-10-12 Apple's GrandSlam answers most identities with error -80045, so the
+    /// identity has to match what the Anisette server generated its data for.
+    func resolveIdentity() async {
+        let identity: AnisetteIdentity
+        
+        if let forced = identityOverride {
+            self.printOut("Using the fallback identity")
+            identity = forced
+        } else {
+            switch AnisetteSettings.mode {
+            case .windows:
+                self.printOut("Using the Windows (iTunes) identity")
+                identity = AnisetteIdentity.windows
+            case .custom:
+                let customInfo = AnisetteSettings.customClientInfo
+                let customAgent = AnisetteSettings.customUserAgent
+                if customInfo.isEmpty || customAgent.isEmpty {
+                    self.printOut("The custom identity is incomplete, using the Windows (iTunes) identity")
+                    identity = AnisetteIdentity.windows
+                } else {
+                    self.printOut("Using the custom identity")
+                    identity = AnisetteIdentity(clientInfo: customInfo, userAgent: customAgent)
+                }
+            case .auto:
+                if let reported = await self.fetchServerIdentity() {
+                    self.printOut("Using the identity reported by the Anisette server")
+                    identity = reported
+                } else {
+                    self.printOut("The Anisette server did not report an identity, using the Windows (iTunes) identity")
+                    identity = AnisetteIdentity.windows
+                }
+            }
+        }
+        
+        self.clientInfo = identity.clientInfo
+        self.userAgent = identity.userAgent
+        self.printOut("Client-Info: \(identity.clientInfo)")
+        self.printOut("User-Agent: \(identity.userAgent)")
+        
+        // StosSign reads the user agent for its GrandSlam requests from here (patched in by build.yml)
+        let defaults = UserDefaults.standard
+        defaults.set(identity.userAgent, forKey: AnisetteSettings.stosSignUserAgentKey)
+        
+        // Provisioning data (adi.pb + identifier) is only valid for the server and identity it was
+        // created with, so start from scratch whenever one of them changes.
+        let fingerprint = "\(self.url?.absoluteString ?? "")|\(identity.clientInfo)|\(identity.userAgent)"
+        let previous = defaults.string(forKey: AnisetteSettings.fingerprintKey)
+        if previous != fingerprint {
+            if defaults.bool(forKey: AnisetteSettings.keepProvisioningOnceKey) {
+                self.printOut("Keeping the imported provisioning data")
+            } else {
+                self.printOut("Anisette server or identity changed, clearing old provisioning data")
+                Keychain.shared.adiPb = nil
+                Keychain.shared.identifier = nil
+                self.mdLu = nil
+                self.deviceId = nil
+            }
+            defaults.set(fingerprint, forKey: AnisetteSettings.fingerprintKey)
+        }
+        defaults.removeObject(forKey: AnisetteSettings.keepProvisioningOnceKey)
+    }
+    
+    /// Asks the Anisette server which client info / user agent its data belongs to.
+    func fetchServerIdentity() async -> AnisetteIdentity? {
+        guard let baseURL = self.url else { return nil }
+        
+        var request = URLRequest(url: baseURL.appendingPathComponent("v3").appendingPathComponent("client_info"))
+        request.timeoutInterval = 10
+        
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                self.printOut("client_info request failed with HTTP \(http.statusCode)")
+                return nil
+            }
+            
+            guard let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+                  let clientInfo = (json["client_info"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  let userAgent = (json["user_agent"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !clientInfo.isEmpty,
+                  !userAgent.isEmpty else {
+                self.printOut("client_info response is not in the expected format")
+                return nil
+            }
+            
+            return AnisetteIdentity(clientInfo: clientInfo, userAgent: userAgent)
+        } catch {
+            self.printOut("Couldn't fetch client_info: \(error.localizedDescription)")
+            return nil
+        }
+    }
+    
+    /// Used by the "Test Server" button in Settings.
+    func testServer() async -> String {
+        guard let serverURL = AnisetteSettings.serverURL else {
+            return "The Anisette server URL is not valid."
+        }
+        self.url = serverURL
+        
+        if let identity = await self.fetchServerIdentity() {
+            return "Server: \(serverURL.absoluteString)\n\nClient info:\n\(identity.clientInfo)\n\nUser agent:\n\(identity.userAgent)"
+        }
+        return "Server: \(serverURL.absoluteString)\n\nThe server did not report a client info / user agent (/v3/client_info). In Auto mode the Windows identity is used instead. Check the URL or try another server."
+    }
+    
     private func printOut(_ text: String?){
         let isInternalLoggingEnabled = true
         if(isInternalLoggingEnabled){
@@ -469,4 +584,96 @@ extension Data {
     
     // https://stackoverflow.com/a/59127761
     func object<T>() -> T { self.withUnsafeBytes { $0.load(as: T.self) } }
+}
+
+
+// MARK: - Anisette identity settings
+
+enum AnisetteIdentityMode: String, CaseIterable, Identifiable {
+    case auto
+    case windows
+    case custom
+    
+    var id: String { rawValue }
+    
+    var title: String {
+        switch self {
+        case .auto: return "Auto (from server)"
+        case .windows: return "Windows (iTunes)"
+        case .custom: return "Custom"
+        }
+    }
+}
+
+struct AnisetteIdentity: Equatable {
+    var clientInfo: String
+    var userAgent: String
+    
+    /// The identity that iTunes for Windows uses. This is what SideStore / iloader switched to on 2026-10-14.
+    static let windows = AnisetteIdentity(
+        clientInfo: "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>",
+        userAgent: "akd/1.0 CFNetwork/808.1.4"
+    )
+}
+
+enum AnisetteSettings {
+    /// Default server since 2026-10-16 (the default of iloader 2.3.9).
+    static let defaultServer = "https://mac-ani.jkcoxson.com"
+    /// Old defaults that Apple's GrandSlam rejects with -80045. They are replaced once.
+    static let legacyDefaultServers = ["https://ani.sidestore.io"]
+    
+    static let serverKey = "AnisetteServer"
+    static let modeKey = "AnisetteIdentityMode"
+    static let customClientInfoKey = "AnisetteCustomClientInfo"
+    static let customUserAgentKey = "AnisetteCustomUserAgent"
+    static let fingerprintKey = "AnisetteIdentityFingerprint"
+    static let keepProvisioningOnceKey = "AnisetteKeepProvisioningOnce"
+    static let migrationKey = "AnisetteDefaultServerMigration202610"
+    static let stosSignUserAgentKey = "GetMoreRam.GSAUserAgent"
+    
+    static var serverString: String {
+        let stored = UserDefaults.standard.string(forKey: serverKey) ?? defaultServer
+        var trimmed = stored.trimmingCharacters(in: .whitespacesAndNewlines)
+        while trimmed.hasSuffix("/") {
+            trimmed.removeLast()
+        }
+        return trimmed.isEmpty ? defaultServer : trimmed
+    }
+    
+    static var serverURL: URL? {
+        return URL(string: serverString)
+    }
+    
+    static var mode: AnisetteIdentityMode {
+        get {
+            return AnisetteIdentityMode(rawValue: UserDefaults.standard.string(forKey: modeKey) ?? "") ?? .auto
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: modeKey)
+        }
+    }
+    
+    static var customClientInfo: String {
+        return (UserDefaults.standard.string(forKey: customClientInfoKey) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    
+    static var customUserAgent: String {
+        return (UserDefaults.standard.string(forKey: customUserAgentKey) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    
+    /// Replaces the old default server once, so existing installs move to a server Apple still accepts.
+    static func migrateLegacyServerIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: migrationKey) else { return }
+        defaults.set(true, forKey: migrationKey)
+        
+        guard let stored = defaults.string(forKey: serverKey) else { return }
+        var normalized = stored.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        while normalized.hasSuffix("/") {
+            normalized.removeLast()
+        }
+        if normalized.isEmpty || legacyDefaultServers.contains(normalized) {
+            defaults.set(defaultServer, forKey: serverKey)
+        }
+    }
 }
